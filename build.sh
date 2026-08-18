@@ -1,6 +1,6 @@
 #!/bin/bash
 set -e
-echo "=== Début du build KernelSU officiel + SusFS pour kiev (SM8250) ==="
+echo "=== Début du build KernelSU officiel v0.9.5 + SusFS ==="
 df -h
 
 sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc
@@ -16,11 +16,11 @@ echo "=== Clonage du kernel ==="
 git clone https://github.com/LineageOS/android_kernel_motorola_sm8250.git -b lineage-23.2 --depth=1 kernel_sources
 cd kernel_sources
 
-echo "=== Intégration KernelSU officiel v0.9.5 (dernière non-GKI) ==="
+echo "=== Intégration KernelSU officiel v0.9.5 ==="
 rm -rf drivers/kernelsu kernelSU susfs4ksu || true
 curl -LSs "https://raw.githubusercontent.com/tiann/KernelSU/main/kernel/setup.sh" | bash -s v0.9.5
 
-echo "=== Hooks KernelSU officiels (méthode manuelle) ==="
+echo "=== Hooks KernelSU v0.9.5 (symboles corrects) ==="
 
 if ! grep -q "ksu_handle_execveat" fs/exec.c; then
   cat > /tmp/hook_execveat_ksu.py << 'PYEOF'
@@ -30,7 +30,6 @@ with open('fs/exec.c', 'r') as f:
 if 'ksu_handle_execveat' not in content:
     extern_decl = '''
 #ifdef CONFIG_KSU
-extern bool ksu_execveat_hook __read_mostly;
 extern int ksu_handle_execveat(int *fd, struct filename **filename_ptr, void *argv,
 			void *envp, int *flags);
 extern int ksu_handle_execveat_sucompat(int *fd, struct filename **filename_ptr,
@@ -46,17 +45,17 @@ extern int ksu_handle_execveat_sucompat(int *fd, struct filename **filename_ptr,
     new_code = '''	struct user_arg_ptr argv = { .ptr.native = __argv };
 	struct user_arg_ptr envp = { .ptr.native = __envp };
 #ifdef CONFIG_KSU
-	if (unlikely(ksu_execveat_hook))
-		ksu_handle_execveat((int *)AT_FDCWD, &filename, &argv, &envp, 0);
-	else
-		ksu_handle_execveat_sucompat((int *)AT_FDCWD, &filename, &argv, &envp, 0);
+	ksu_handle_execveat((int *)AT_FDCWD, &filename, &argv, &envp, 0);
 #endif
 	return do_execveat_common(AT_FDCWD, filename, argv, envp, 0);'''
     if old_code in content:
         content = content.replace(old_code, new_code, 1)
-        print("OK: execveat (officiel)")
+        print("OK: execveat (v0.9.5)")
     else:
-        print("Pattern non trouvé pour execveat")
+        pattern = r'(int do_execve\(struct filename \*filename,.*?struct user_arg_ptr envp = \{ \.ptr\.native = __envp \};\n)'
+        replacement = r'\1#ifdef CONFIG_KSU\n\tksu_handle_execveat((int *)AT_FDCWD, &filename, &argv, &envp, 0);\n#endif\n'
+        content = re.sub(pattern, replacement, content, count=1)
+        print("OK: execveat (alternatif)")
 with open('fs/exec.c', 'w') as f:
     f.write(content)
 PYEOF
@@ -88,9 +87,12 @@ extern int ksu_handle_faccessat(int *dfd, const char __user **filename_user, int
 	return do_faccessat(dfd, filename, mode);'''
     if old_code in content:
         content = content.replace(old_code, new_code, 1)
-        print("OK: faccessat (officiel)")
+        print("OK: faccessat (v0.9.5)")
     else:
-        print("Pattern non trouvé pour faccessat")
+        pattern = r'(SYSCALL_DEFINE3\(faccessat.*?\n\{)'
+        replacement = r'\1\n#ifdef CONFIG_KSU\n\tksu_handle_faccessat(&dfd, &filename, &mode, NULL);\n#endif'
+        content = re.sub(pattern, replacement, content, count=1)
+        print("OK: faccessat (alternatif)")
 with open('fs/open.c', 'w') as f:
     f.write(content)
 PYEOF
@@ -120,7 +122,7 @@ extern int ksu_handle_stat(int *dfd, const char __user **filename_user, int *fla
 #endif'''
     if old_code in content:
         content = content.replace(old_code, new_code, 1)
-        print("OK: stat (officiel)")
+        print("OK: stat (v0.9.5)")
     else:
         print("Pattern non trouvé pour stat")
 with open('fs/stat.c', 'w') as f:
@@ -152,7 +154,7 @@ extern int ksu_handle_input_handle_event(unsigned int *type, unsigned int *code,
 #endif'''
     if old_code in content:
         content = content.replace(old_code, new_code, 1)
-        print("OK: input_handle_event (officiel)")
+        print("OK: input (v0.9.5 avec bool ksu_input_hook)")
     else:
         print("Pattern non trouvé pour input")
 with open('drivers/input/input.c', 'w') as f:
@@ -184,7 +186,7 @@ extern int ksu_handle_devpts(struct inode*);
 #endif'''
     if old_code in content:
         content = content.replace(old_code, new_code, 1)
-        print("OK: devpts (officiel)")
+        print("OK: devpts")
     else:
         print("Pattern non trouvé pour devpts")
 with open('fs/devpts/inode.c', 'w') as f:
@@ -193,7 +195,7 @@ PYEOF
   python3 /tmp/hook_devpts.py
 fi
 
-echo "=== Backport path_umount pour module umount ==="
+echo "=== Backport path_umount ==="
 if ! grep -q "int path_umount" fs/namespace.c; then
   cat > /tmp/backport_path_umount.py << 'PYEOF'
 import re
@@ -234,14 +236,12 @@ int path_umount(struct path *path, int flags)
 	return ret;
 }
 '''
-    # Insérer avant "Now umount can handle mount points"
     pattern = r'(/\*\s*\n \* Now umount can handle mount points)'
     content = re.sub(pattern, backport + '\n' + r'\1', content, count=1)
     
     if 'int path_umount' in content:
         print("OK: path_umount backporté")
     else:
-        # Alternative : insérer après la fonction may_mandlock
         pattern2 = r'(static inline bool may_mandlock\(void\)\n\{.*?\n\}\n)'
         content = re.sub(pattern2, r'\1\n' + backport + '\n', content, count=1)
         print("OK: path_umount backporté (alternatif)")
@@ -251,7 +251,7 @@ PYEOF
   python3 /tmp/backport_path_umount.py
 fi
 
-echo "=== Téléchargement du repo JackA1ltman pour SusFS ==="
+echo "=== Téléchargement du repo JackA1ltman ==="
 git clone --depth=1 https://github.com/JackA1ltman/NonGKI_Kernel_Build_2nd.git /tmp/jack_repo 2>/dev/null || true
 
 echo "=== Application du patch SusFS 4.19 ==="
@@ -321,7 +321,7 @@ PYEOF
   python3 /tmp/hook_setresuid.py
 fi
 
-# 4. Ajouter ksu_handle_sys_read APRÈS ksys_read
+# 4. Ajouter ksu_handle_sys_read avec bool ksu_init_rc_hook
 if ! grep -q "ksu_handle_sys_read" fs/read_write.c; then
   cat > /tmp/hook_read.py << 'PYEOF'
 import re
@@ -330,7 +330,7 @@ with open('fs/read_write.c', 'r') as f:
 if 'ksu_handle_sys_read' not in content:
     extern_decl = '''
 #ifdef CONFIG_KSU
-extern struct static_key_true ksu_is_init_rc_hook_enabled;
+extern bool ksu_init_rc_hook __read_mostly;
 extern __attribute__((cold)) int ksu_handle_sys_read(unsigned int fd);
 #endif
 '''
@@ -338,23 +338,23 @@ extern __attribute__((cold)) int ksu_handle_sys_read(unsigned int fd);
     content = re.sub(pattern, extern_decl + '\n' + r'\1', content, count=1)
     old_code = '''	return ksys_read(fd, buf, count);'''
     new_code = '''#ifdef CONFIG_KSU
-	if (static_branch_unlikely(&ksu_is_init_rc_hook_enabled))
+	if (unlikely(ksu_init_rc_hook))
 		ksu_handle_sys_read(fd);
 #endif
 	return ksys_read(fd, buf, count);'''
     if old_code in content:
         content = content.replace(old_code, new_code, 1)
-        print("OK: sys_read APRÈS ksys_read")
+        print("OK: sys_read avec bool ksu_init_rc_hook")
     else:
         old_code2 = '''	if (f.file) {'''
         new_code2 = '''#ifdef CONFIG_KSU
-	if (static_branch_unlikely(&ksu_is_init_rc_hook_enabled))
+	if (unlikely(ksu_init_rc_hook))
 		ksu_handle_sys_read(fd);
 #endif
 	if (f.file) {'''
         if old_code2 in content:
             content = content.replace(old_code2, new_code2, 1)
-            print("OK: sys_read APRÈS fdget_pos")
+            print("OK: sys_read (alternatif)")
         else:
             print("ERREUR: pattern non trouvé")
 with open('fs/read_write.c', 'w') as f:
