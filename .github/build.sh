@@ -1,6 +1,6 @@
 #!/bin/bash
 set -e
-echo "=== Début du build KernelSU officiel + SusFS ==="
+echo "=== Début du build KernelSU officiel + SusFS pour kiev (SM8250) ==="
 df -h
 
 sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc
@@ -16,61 +16,63 @@ echo "=== Clonage du kernel ==="
 git clone https://github.com/LineageOS/android_kernel_motorola_sm8250.git -b lineage-23.2 --depth=1 kernel_sources
 cd kernel_sources
 
-echo "=== Intégration KernelSU officiel ==="
+echo "=== Intégration KernelSU officiel v0.9.5 (dernière non-GKI) ==="
 rm -rf drivers/kernelsu kernelSU susfs4ksu || true
-curl -LSs "https://raw.githubusercontent.com/tiann/KernelSU/main/kernel/setup.sh" | bash
+curl -LSs "https://raw.githubusercontent.com/tiann/KernelSU/main/kernel/setup.sh" | bash -s v0.9.5
 
-echo "=== Hooks KernelSU (manuels nécessaires) ==="
+echo "=== Hooks KernelSU officiels (méthode manuelle) ==="
 
 if ! grep -q "ksu_handle_execveat" fs/exec.c; then
-  cat > /tmp/hook_execveat.py << 'PYEOF'
+  cat > /tmp/hook_execveat_ksu.py << 'PYEOF'
 import re
 with open('fs/exec.c', 'r') as f:
     content = f.read()
 if 'ksu_handle_execveat' not in content:
     extern_decl = '''
 #ifdef CONFIG_KSU
-__attribute__((hot))
-extern int ksu_handle_execveat(int *fd, struct filename **filename_ptr,
-				void *argv, void *envp, int *flags);
+extern bool ksu_execveat_hook __read_mostly;
+extern int ksu_handle_execveat(int *fd, struct filename **filename_ptr, void *argv,
+			void *envp, int *flags);
+extern int ksu_handle_execveat_sucompat(int *fd, struct filename **filename_ptr,
+				 void *argv, void *envp, int *flags);
 #endif
 '''
     pattern = r'(static int do_execveat_common\()'
     content = re.sub(pattern, extern_decl + '\n' + r'\1', content, count=1)
+    
     old_code = '''	struct user_arg_ptr argv = { .ptr.native = __argv };
 	struct user_arg_ptr envp = { .ptr.native = __envp };
 	return do_execveat_common(AT_FDCWD, filename, argv, envp, 0);'''
     new_code = '''	struct user_arg_ptr argv = { .ptr.native = __argv };
 	struct user_arg_ptr envp = { .ptr.native = __envp };
 #ifdef CONFIG_KSU
-	ksu_handle_execveat((int *)AT_FDCWD, &filename, &argv, &envp, 0);
+	if (unlikely(ksu_execveat_hook))
+		ksu_handle_execveat((int *)AT_FDCWD, &filename, &argv, &envp, 0);
+	else
+		ksu_handle_execveat_sucompat((int *)AT_FDCWD, &filename, &argv, &envp, 0);
 #endif
 	return do_execveat_common(AT_FDCWD, filename, argv, envp, 0);'''
     if old_code in content:
         content = content.replace(old_code, new_code, 1)
-        print("OK: execveat")
+        print("OK: execveat (officiel)")
     else:
-        pattern = r'(int do_execve\(struct filename \*filename,.*?struct user_arg_ptr envp = \{ \.ptr\.native = __envp \};\n)'
-        replacement = r'\1#ifdef CONFIG_KSU\n\tksu_handle_execveat((int *)AT_FDCWD, &filename, &argv, &envp, 0);\n#endif\n'
-        content = re.sub(pattern, replacement, content, count=1)
-        print("OK: execveat (alternatif)")
+        print("Pattern non trouvé pour execveat")
 with open('fs/exec.c', 'w') as f:
     f.write(content)
 PYEOF
-  python3 /tmp/hook_execveat.py
+  python3 /tmp/hook_execveat_ksu.py
 fi
 
 if ! grep -q "ksu_handle_faccessat" fs/open.c; then
-  cat > /tmp/hook_faccessat.py << 'PYEOF'
+  cat > /tmp/hook_faccessat_ksu.py << 'PYEOF'
 import re
 with open('fs/open.c', 'r') as f:
     content = f.read()
 if 'ksu_handle_faccessat' not in content:
     extern_decl = '''
 #ifdef CONFIG_KSU
-__attribute__((hot))
-extern int ksu_handle_faccessat(int *dfd, const char __user **filename_user,
-				int *mode, int *flags);
+extern int ksu_handle_faccessat(int *dfd, const char __user **filename_user, int *mode,
+			        int *flags);
 #endif
 '''
     pattern = r'(SYSCALL_DEFINE3\(faccessat)'
@@ -86,170 +88,173 @@ extern int ksu_handle_faccessat(int *dfd, const char __user **filename_user,
 	return do_faccessat(dfd, filename, mode);'''
     if old_code in content:
         content = content.replace(old_code, new_code, 1)
-        print("OK: faccessat")
+        print("OK: faccessat (officiel)")
     else:
-        pattern = r'(SYSCALL_DEFINE3\(faccessat.*?\n\{)'
-        replacement = r'\1\n#ifdef CONFIG_KSU\n\tksu_handle_faccessat(&dfd, &filename, &mode, NULL);\n#endif'
-        content = re.sub(pattern, replacement, content, count=1)
-        print("OK: faccessat (alternatif)")
+        print("Pattern non trouvé pour faccessat")
 with open('fs/open.c', 'w') as f:
     f.write(content)
 PYEOF
-  python3 /tmp/hook_faccessat.py
+  python3 /tmp/hook_faccessat_ksu.py
 fi
 
-if ! grep -q "ksu_handle_fstat64_ret" fs/stat.c; then
-  cat > /tmp/hook_stat_complete.py << 'PYEOF'
+if ! grep -q "ksu_handle_stat" fs/stat.c; then
+  cat > /tmp/hook_stat_ksu.py << 'PYEOF'
 import re
-
 with open('fs/stat.c', 'r') as f:
     content = f.read()
-
 if 'ksu_handle_stat' not in content:
     extern_decl = '''
 #ifdef CONFIG_KSU
-__attribute__((hot))
-extern int ksu_handle_stat(int *dfd, const char __user **filename_user,
-				int *flags);
-extern void ksu_handle_newfstat_ret(unsigned int *fd, struct stat __user **statbuf_ptr);
-#if defined(__ARCH_WANT_STAT64) || defined(__ARCH_WANT_COMPAT_STAT64)
-extern void ksu_handle_fstat64_ret(unsigned long *fd, struct stat64 __user **statbuf_ptr);
-#endif
+extern int ksu_handle_stat(int *dfd, const char __user **filename_user, int *flags);
 #endif
 '''
-    pattern = r'(SYSCALL_DEFINE4\(newfstatat)'
+    pattern = r'(int vfs_fstatat\(int dfd, const char __user \*filename, struct kstat \*stat,)'
     content = re.sub(pattern, extern_decl + '\n' + r'\1', content, count=1)
-
-if 'ksu_handle_stat(&dfd' not in content:
-    old_code = '''	struct kstat stat;
-	int error;
-
-	return vfs_fstatat(dfd, filename, &stat, flag);'''
-    new_code = '''	struct kstat stat;
-	int error;
-
+    
+    old_code = '''	int error = -EINVAL;
+	unsigned int lookup_flags = 0;'''
+    new_code = '''	int error = -EINVAL;
+	unsigned int lookup_flags = 0;
 #ifdef CONFIG_KSU
 	ksu_handle_stat(&dfd, &filename, &flag);
-#endif
-	return vfs_fstatat(dfd, filename, &stat, flag);'''
+#endif'''
     if old_code in content:
         content = content.replace(old_code, new_code, 1)
-        print("OK: stat")
+        print("OK: stat (officiel)")
     else:
-        pattern = r'(SYSCALL_DEFINE4\(newfstatat.*?int error;\n)'
-        replacement = r'\1#ifdef CONFIG_KSU\n\tksu_handle_stat(&dfd, &filename, &flag);\n#endif\n'
-        content = re.sub(pattern, replacement, content, count=1)
-        print("OK: stat (alternatif)")
-
-if 'ksu_handle_newfstat_ret' not in content:
-    old_code = '''SYSCALL_DEFINE2(newfstat, unsigned int, fd, struct stat __user *, statbuf)
-{
-	struct kstat stat;
-	int error = vfs_fstat(fd, &stat);
-
-	if (!error)
-		error = cp_new_stat(&stat, statbuf);
-
-	return error;'''
-    new_code = '''SYSCALL_DEFINE2(newfstat, unsigned int, fd, struct stat __user *, statbuf)
-{
-	struct kstat stat;
-	int error = vfs_fstat(fd, &stat);
-
-	if (!error)
-		error = cp_new_stat(&stat, statbuf);
-
-#ifdef CONFIG_KSU
-	ksu_handle_newfstat_ret(&fd, &statbuf);
-#endif
-	return error;'''
-    if old_code in content:
-        content = content.replace(old_code, new_code, 1)
-        print("OK: newfstat_ret")
-
-if 'ksu_handle_fstat64_ret' not in content:
-    old_code = '''SYSCALL_DEFINE2(fstat64, unsigned long, fd, struct stat64 __user *, statbuf)
-{
-	struct kstat stat;
-	int error = vfs_fstat(fd, &stat);
-
-	if (!error)
-		error = cp_new_stat64(&stat, statbuf);
-
-	return error;'''
-    new_code = '''SYSCALL_DEFINE2(fstat64, unsigned long, fd, struct stat64 __user *, statbuf)
-{
-	struct kstat stat;
-	int error = vfs_fstat(fd, &stat);
-
-	if (!error)
-		error = cp_new_stat64(&stat, statbuf);
-
-#ifdef CONFIG_KSU
-	ksu_handle_fstat64_ret(&fd, &statbuf);
-#endif
-	return error;'''
-    if old_code in content:
-        content = content.replace(old_code, new_code, 1)
-        print("OK: fstat64_ret")
-    else:
-        pattern = r'(SYSCALL_DEFINE2\(fstat64.*?return error;\n)'
-        replacement = r'\1#ifdef CONFIG_KSU\n\tksu_handle_fstat64_ret(&fd, &statbuf);\n#endif\n'
-        content = re.sub(pattern, replacement, content, count=1)
-        print("OK: fstat64_ret (alternatif)")
-
+        print("Pattern non trouvé pour stat")
 with open('fs/stat.c', 'w') as f:
     f.write(content)
-print("=== Hooks stat terminés ===")
 PYEOF
-  python3 /tmp/hook_stat_complete.py
+  python3 /tmp/hook_stat_ksu.py
 fi
 
-if ! grep -q "ksu_handle_sys_reboot" kernel/reboot.c; then
-  cat > /tmp/hook_reboot.py << 'PYEOF'
+if ! grep -q "ksu_handle_input_handle_event" drivers/input/input.c; then
+  cat > /tmp/hook_input_ksu.py << 'PYEOF'
 import re
-
-with open('kernel/reboot.c', 'r') as f:
+with open('drivers/input/input.c', 'r') as f:
     content = f.read()
-
-if 'ksu_handle_sys_reboot' not in content:
+if 'ksu_handle_input_handle_event' not in content:
     extern_decl = '''
 #ifdef CONFIG_KSU
-extern int ksu_handle_sys_reboot(int magic1, int magic2, unsigned int cmd, void __user **arg);
+extern bool ksu_input_hook __read_mostly;
+extern int ksu_handle_input_handle_event(unsigned int *type, unsigned int *code, int *value);
 #endif
 '''
-    pattern = r'(SYSCALL_DEFINE4\(reboot)'
+    pattern = r'(static void input_handle_event\(struct input_dev \*dev,)'
     content = re.sub(pattern, extern_decl + '\n' + r'\1', content, count=1)
     
-    old_code = '''	char buffer[256];
-	int ret = 0;'''
-    
-    new_code = '''	char buffer[256];
-	int ret = 0;
-
+    old_code = '''	int disposition = input_get_disposition(dev, type, code, &value);'''
+    new_code = '''	int disposition = input_get_disposition(dev, type, code, &value);
 #ifdef CONFIG_KSU
-	ksu_handle_sys_reboot(magic1, magic2, cmd, &arg);
+	if (unlikely(ksu_input_hook))
+		ksu_handle_input_handle_event(&type, &code, &value);
 #endif'''
-    
     if old_code in content:
         content = content.replace(old_code, new_code, 1)
-        print("OK: sys_reboot")
+        print("OK: input_handle_event (officiel)")
     else:
-        pattern = r'(SYSCALL_DEFINE4\(reboot.*?\n\{)'
-        replacement = r'\1\n#ifdef CONFIG_KSU\n\tksu_handle_sys_reboot(magic1, magic2, cmd, &arg);\n#endif'
-        content = re.sub(pattern, replacement, content, count=1)
-        print("OK: sys_reboot (alternatif)")
-
-with open('kernel/reboot.c', 'w') as f:
+        print("Pattern non trouvé pour input")
+with open('drivers/input/input.c', 'w') as f:
     f.write(content)
 PYEOF
-  python3 /tmp/hook_reboot.py
+  python3 /tmp/hook_input_ksu.py
 fi
 
-echo "=== Téléchargement du repo JackA1ltman ==="
+if ! grep -q "ksu_handle_devpts" fs/devpts/inode.c; then
+  cat > /tmp/hook_devpts.py << 'PYEOF'
+import re
+with open('fs/devpts/inode.c', 'r') as f:
+    content = f.read()
+if 'ksu_handle_devpts' not in content:
+    extern_decl = '''
+#ifdef CONFIG_KSU
+extern int ksu_handle_devpts(struct inode*);
+#endif
+'''
+    pattern = r'(void \*devpts_get_priv\(struct dentry \*dentry\))'
+    content = re.sub(pattern, extern_decl + '\n' + r'\1', content, count=1)
+    
+    old_code = '''void *devpts_get_priv(struct dentry *dentry)
+{'''
+    new_code = '''void *devpts_get_priv(struct dentry *dentry)
+{
+#ifdef CONFIG_KSU
+	ksu_handle_devpts(dentry->d_inode);
+#endif'''
+    if old_code in content:
+        content = content.replace(old_code, new_code, 1)
+        print("OK: devpts (officiel)")
+    else:
+        print("Pattern non trouvé pour devpts")
+with open('fs/devpts/inode.c', 'w') as f:
+    f.write(content)
+PYEOF
+  python3 /tmp/hook_devpts.py
+fi
+
+echo "=== Backport path_umount pour module umount ==="
+if ! grep -q "int path_umount" fs/namespace.c; then
+  cat > /tmp/backport_path_umount.py << 'PYEOF'
+import re
+with open('fs/namespace.c', 'r') as f:
+    content = f.read()
+if 'int path_umount' not in content:
+    backport = '''
+static int can_umount(const struct path *path, int flags)
+{
+	struct mount *mnt = real_mount(path->mnt);
+
+	if (flags & ~(MNT_FORCE | MNT_DETACH | MNT_EXPIRE | UMOUNT_NOFOLLOW))
+		return -EINVAL;
+	if (!may_mount())
+		return -EPERM;
+	if (path->dentry != path->mnt->mnt_root)
+		return -EINVAL;
+	if (!check_mnt(mnt))
+		return -EINVAL;
+	if (mnt->mnt.mnt_flags & MNT_LOCKED)
+		return -EINVAL;
+	if (flags & MNT_FORCE && !capable(CAP_SYS_ADMIN))
+		return -EPERM;
+	return 0;
+}
+
+int path_umount(struct path *path, int flags)
+{
+	struct mount *mnt = real_mount(path->mnt);
+	int ret;
+
+	ret = can_umount(path, flags);
+	if (!ret)
+		ret = do_umount(mnt, flags);
+
+	dput(path->dentry);
+	mntput_no_expire(mnt);
+	return ret;
+}
+'''
+    # Insérer avant "Now umount can handle mount points"
+    pattern = r'(/\*\s*\n \* Now umount can handle mount points)'
+    content = re.sub(pattern, backport + '\n' + r'\1', content, count=1)
+    
+    if 'int path_umount' in content:
+        print("OK: path_umount backporté")
+    else:
+        # Alternative : insérer après la fonction may_mandlock
+        pattern2 = r'(static inline bool may_mandlock\(void\)\n\{.*?\n\}\n)'
+        content = re.sub(pattern2, r'\1\n' + backport + '\n', content, count=1)
+        print("OK: path_umount backporté (alternatif)")
+with open('fs/namespace.c', 'w') as f:
+    f.write(content)
+PYEOF
+  python3 /tmp/backport_path_umount.py
+fi
+
+echo "=== Téléchargement du repo JackA1ltman pour SusFS ==="
 git clone --depth=1 https://github.com/JackA1ltman/NonGKI_Kernel_Build_2nd.git /tmp/jack_repo 2>/dev/null || true
 
-echo "=== Application du patch SusFS 4.19 à jour ==="
+echo "=== Application du patch SusFS 4.19 ==="
 PATCH_419=$(find /tmp/jack_repo/Patches -name "*4.19*" -name "*.patch" | head -1)
 if [ -n "$PATCH_419" ]; then
   echo "Application du patch: $PATCH_419"
@@ -358,48 +363,6 @@ PYEOF
   python3 /tmp/hook_read.py
 fi
 
-# 5. Ajouter ksu_handle_input_handle_event
-if ! grep -q "ksu_handle_input_handle_event" drivers/input/input.c; then
-  cat > /tmp/hook_input.py << 'PYEOF'
-import re
-with open('drivers/input/input.c', 'r') as f:
-    content = f.read()
-if 'ksu_handle_input_handle_event' not in content:
-    extern_decl = '''
-#ifdef CONFIG_KSU
-extern struct static_key_true ksu_is_input_hook_enabled;
-extern int ksu_handle_input_handle_event(unsigned int *type, unsigned int *code, int *value);
-#endif
-'''
-    pattern = r'(static void input_handle_event\(struct input_dev \*dev,)'
-    content = re.sub(pattern, extern_decl + '\n' + r'\1', content, count=1)
-    old_code = '''	if (is_event_supported(type, dev->evbit, EV_MAX)) {'''
-    new_code = '''#ifdef CONFIG_KSU
-	if (static_branch_unlikely(&ksu_is_input_hook_enabled))
-		ksu_handle_input_handle_event(&type, &code, &value);
-#endif
-	if (is_event_supported(type, dev->evbit, EV_MAX)) {'''
-    if old_code in content:
-        content = content.replace(old_code, new_code, 1)
-        print("OK: input_handle_event")
-    else:
-        old_code2 = '''	input_get_disposition(dev, type, code, &value);'''
-        new_code2 = '''#ifdef CONFIG_KSU
-	if (static_branch_unlikely(&ksu_is_input_hook_enabled))
-		ksu_handle_input_handle_event(&type, &code, &value);
-#endif
-	input_get_disposition(dev, type, code, &value);'''
-        if old_code2 in content:
-            content = content.replace(old_code2, new_code2, 1)
-            print("OK: input_handle_event (alternatif)")
-        else:
-            print("ERREUR: pattern non trouvé")
-with open('drivers/input/input.c', 'w') as f:
-    f.write(content)
-PYEOF
-  python3 /tmp/hook_input.py
-fi
-
 echo "=== Configuration ==="
 export ARCH=arm64
 export SUBARCH=arm64
@@ -418,7 +381,7 @@ make O=out LLVM=1 CROSS_COMPILE=$CROSS_COMPILE CROSS_COMPILE_ARM32=$CROSS_COMPIL
   echo "CONFIG_KSU=y"
   echo "CONFIG_KPROBES=y"
   echo "CONFIG_HAVE_KPROBES=y"
-  echo "CONFIG_KRETPROBES=y"
+  echo "CONFIG_KPROBE_EVENTS=y"
   echo "CONFIG_COMPAT=y"
   echo "CONFIG_COMPAT_32BIT_TIME=y"
   echo "# CONFIG_COMPAT_VDSO is not set"
